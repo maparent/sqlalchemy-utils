@@ -12,6 +12,26 @@ from .exceptions import ImproperlyConfigured
 from .functions import identity
 
 
+class TypeMapper(object):
+
+    def class_to_value(self, cls):
+        return six.text_type(cls.__name__)
+
+    def column_is_type(self, column, other_type):
+        mapper = sa.inspect(other_type)
+        # Iterate through the weak sequence in order to get the actual
+        # mappers
+        class_names = [self.class_to_value(other_type)]
+        class_names.extend([
+            self.class_to_value(submapper.class_)
+            for submapper in mapper._inheriting_mappers
+        ])
+        return column.in_(class_names)
+
+    def value_to_class(self, value, base_class):
+        return base_class._decl_class_registry.get(value)
+
+
 class GenericAttributeImpl(attributes.ScalarAttributeImpl):
     def get(self, state, dict_, passive=attributes.PASSIVE_OFF):
         if self.key in dict_:
@@ -27,7 +47,7 @@ class GenericAttributeImpl(attributes.ScalarAttributeImpl):
         # Find class for discriminator.
         # TODO: Perhaps optimize with some sort of lookup?
         discriminator = self.get_state_discriminator(state)
-        target_class = state.class_._decl_class_registry.get(discriminator)
+        target_class = self.parent_token.type_mapper.value_to_class(discriminator, state.class_)
 
         if target_class is None:
             # Unknown discriminator; return nothing.
@@ -73,7 +93,7 @@ class GenericAttributeImpl(attributes.ScalarAttributeImpl):
             pk = mapper.identity_key_from_instance(initiator)[1]
 
             # Set the identifier and the discriminator.
-            discriminator = six.text_type(class_.__name__)
+            discriminator = self.parent_token.type_mapper.class_to_value(class_)
 
             for index, id in enumerate(self.parent_token.id):
                 dict_[id.key] = pk[index]
@@ -92,9 +112,10 @@ class GenericRelationshipProperty(MapperProperty):
         Field to point to the model we are referring to.
     """
 
-    def __init__(self, discriminator, id, doc=None):
+    def __init__(self, discriminator, id, type_mapper=None, doc=None):
         super(GenericRelationshipProperty, self).__init__()
         self._discriminator_col = discriminator
+        self.type_mapper = type_mapper or TypeMapper()
         self._id_cols = id
         self._id = None
         self._discriminator = None
@@ -143,7 +164,7 @@ class GenericRelationshipProperty(MapperProperty):
             self._parententity = parentmapper
 
         def __eq__(self, other):
-            discriminator = six.text_type(type(other).__name__)
+            discriminator = self.property.type_mapper.class_to_value(type(other))
             q = self.property._discriminator_col == discriminator
             other_id = identity(other)
             for index, id in enumerate(self.property._id_cols):
@@ -154,16 +175,7 @@ class GenericRelationshipProperty(MapperProperty):
             return ~(self == other)
 
         def is_type(self, other):
-            mapper = sa.inspect(other)
-            # Iterate through the weak sequence in order to get the actual
-            # mappers
-            class_names = [six.text_type(other.__name__)]
-            class_names.extend([
-                six.text_type(submapper.class_.__name__)
-                for submapper in mapper._inheriting_mappers
-            ])
-
-            return self.property._discriminator_col.in_(class_names)
+            return self.type_mapper.column_is_type(self.property._discriminator_col, other)
 
     def instrument_class(self, mapper):
         attributes.register_attribute(
