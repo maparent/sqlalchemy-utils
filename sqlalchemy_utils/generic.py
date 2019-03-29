@@ -92,7 +92,9 @@ class GenericAttributeImpl(attributes.ScalarObjectAttributeImpl):
             # can support this assignment.
             class_ = type(initiator)
             mapper = class_mapper(class_)
-
+            dp = self.parent_token._dependency_processor
+            if dp not in mapper._dependency_processors:
+                mapper._dependency_processors.append(dp)
             pk = mapper.identity_key_from_instance(initiator)[1]
 
             # Set the identifier and the discriminator.
@@ -110,12 +112,14 @@ class GenericManyToOneDP(ManyToOneDP):
     def __init__(self, prop):
         super(GenericManyToOneDP, self).__init__(prop)
         self.mapper._dependency_processors.append(self)
-        self.mapper = self.prop.mapper   # temporary
         # NOTE should I make it into a threadlocal property? or lock?
 
     def mapper_for_state(self, state):
         # TODO: using the object itself?
-        val = getattr(state._strong_obj, self.prop.discriminator.key)
+        obj = state.obj()
+        if not obj:
+            return
+        val = getattr(obj, self.prop.discriminator.key)
         if val:
             cls = self.prop.type_mapper.value_to_class(val, self.parent.class_)
             if cls:
@@ -132,7 +136,9 @@ class GenericManyToOneDP(ManyToOneDP):
         for mapper, states in self.group_states(states):
             self.mapper = mapper
             for state in states:
-                obj = state._strong_obj
+                obj = state.obj()
+                if not obj:
+                    continue
                 keys = [c.key for c in self.prop.id]
                 if not all([getattr(obj, key) for key in keys]):
                     target = getattr(obj, self.prop.key)
@@ -145,7 +151,7 @@ class GenericManyToOneDP(ManyToOneDP):
     def process_deletes(self, uowcommit, states):
         for mapper, states in self.group_states(states):
             self.mapper = mapper
-            super(GenericManyToOneDP, self).process_saves(uowcommit, states)
+            super(GenericManyToOneDP, self).process_deletes(uowcommit, states)
 
     def prop_has_changes(self, uowcommit, states, isdelete):
         for mapper, states in self.group_states(states):
@@ -179,34 +185,39 @@ class GenericManyToOneDP(ManyToOneDP):
         self.mapper = self.mapper_for_state(state)
         return super(GenericManyToOneDP, self)._verify_canload(state)
 
+    def _synchronize_pairs(self):
+        source = self.mapper.columns.get('id', None) if self.mapper else None
+        return ((source, self.prop._id_cols),)
+
     def _synchronize(self, state, child, associationrow,
                      clearkeys, uowcommit, operation=None):
-        if state is None or \
-                (not self.post_update and uowcommit.is_deleted(state)):
+        self.mapper = self.mapper_for_state(state)
+        source = state
+        dest = child
+        self._verify_canload(child)
+        if dest is None or (
+            not self.post_update and uowcommit.is_deleted(dest)
+        ):
             return
-
-        if operation is not None and \
-                child is not None and \
-                not uowcommit.session._contains_state(child):
-            warn(
-                "Object of type %s not in session, %s "
-                "operation along '%s' won't proceed" %
-                (mapperutil.state_class_str(child), operation, self.prop))
-            return
-
-        synchronize_pairs = (
-            child.__class__.__mapper__.primary_key[0],
-            self.id)
-        if clearkeys or child is None:
-            sync.clear(state, self.parent, synchronize_pairs)
+        synchronize_pairs = self._synchronize_pairs()
+        if clearkeys:
+            sync.clear(dest, self.mapper, synchronize_pairs)
         else:
-            self._verify_canload(child)
-            mapper = self.mapper_for_state(state)
-            sync.populate(child, mapper, state,
-                          self.parent,
-                          synchronize_pairs,
-                          uowcommit,
-                          False)
+            sync.populate(
+                source,
+                self.parent,
+                dest,
+                self.mapper,
+                synchronize_pairs,
+                uowcommit,
+                self.passive_updates and pks_changed,
+            )
+
+    def _pks_changed(self, uowcommit, state):
+        self.mapper = self.mapper_for_state(state)
+        return sync.source_modified(
+            uowcommit, state, self.parent, self._synchronize_pairs()
+        )
 
 
 class GenericRelationshipProperty(MapperProperty):
